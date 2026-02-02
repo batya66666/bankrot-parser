@@ -5,9 +5,10 @@ import re
 import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openpyxl import load_workbook
+
 import pandas as pd
 from bs4 import BeautifulSoup
+from openpyxl import load_workbook
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -17,6 +18,22 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException
+
+
+# ----------------------------
+# Output columns (strict order)
+# ----------------------------
+OUTPUT_COLUMNS = [
+    "Номер аукциона / лота",
+    "Адрес объекта",
+    "Начальная цена",
+    "Шаг аукциона",
+    "Размер задатка",
+    "Дата и время начала / окончания торгов",
+    "Статус аукциона",
+    "Информация о должнике",
+    "Описание объекта",
+]
 
 
 # ----------------------------
@@ -58,6 +75,65 @@ class SeenLotsStore:
 
 
 # ----------------------------
+# Excel append (one file, append rows)
+# ----------------------------
+def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
+    """
+    rows: list[dict] with keys = OUTPUT_COLUMNS
+    Appends new rows to an existing Excel file (or creates it).
+    """
+    if not rows:
+        print("Нет новых данных для записи в Excel.")
+        return
+
+    df_new = pd.DataFrame(rows)
+
+    # ensure all columns exist and strict order
+    for col in OUTPUT_COLUMNS:
+        if col not in df_new.columns:
+            df_new[col] = ""
+    df_new = df_new[OUTPUT_COLUMNS]
+
+    # create file if not exists
+    if not os.path.exists(filename):
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+        print(f"Создан новый Excel: {filename}")
+        return
+
+    wb = load_workbook(filename)
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        start_row = ws.max_row + 1
+    else:
+        ws = wb.create_sheet(sheet_name)
+        start_row = 1
+
+    # append
+    with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+        if start_row == 1:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+        else:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
+
+    # quick autosize for the active sheet (not perfect but OK)
+    wb = load_workbook(filename)
+    ws = wb[sheet_name]
+    max_row = min(ws.max_row, 300)
+    for col_idx in range(1, ws.max_column + 1):
+        max_len = 0
+        for r in range(1, max_row + 1):
+            v = ws.cell(row=r, column=col_idx).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 80)
+    wb.save(filename)
+
+    print(f"Добавлено строк в {filename}: {len(df_new)}")
+
+
+# ----------------------------
 # Parser
 # ----------------------------
 class BankrotParser:
@@ -67,6 +143,7 @@ class BankrotParser:
         chrome_options = Options()
         if headless:
             chrome_options.add_argument("--headless=new")
+
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_argument("--window-size=1400,900")
         chrome_options.add_argument(
@@ -74,9 +151,21 @@ class BankrotParser:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
         )
 
+        # Optional: if you want to use your Chrome profile (helps if site blocks)
+        # Close all Chrome windows before enabling this!
+        # chrome_options.add_argument(r"--user-data-dir=C:\Users\basch\AppData\Local\Google\Chrome\User Data")
+        # chrome_options.add_argument(r"--profile-directory=Default")
+
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+
         self.driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()),
             options=chrome_options
+        )
+        self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
         )
         self.driver.set_page_load_timeout(page_load_timeout)
         self.wait = WebDriverWait(self.driver, 12)
@@ -91,6 +180,7 @@ class BankrotParser:
     def _parse_info_wrapper(self, soup, title_text: str):
         wrappers = soup.select("div.lot-info__wrapper")
         target = title_text.strip().lower()
+
         for w in wrappers:
             h3 = w.select_one("h3.lot-info__title")
             if not h3:
@@ -107,13 +197,16 @@ class BankrotParser:
                 key = sub.get_text(" ", strip=True).strip()
                 val = val_el.get_text(" ", strip=True).strip()
                 out[key] = val
+
             return out
+
         return {}
 
     def _extract_lot_and_trade_numbers(self, soup):
         el = soup.select_one("span.lot__help")
         if not el:
             return ("Не найдено", "Не найдено")
+
         text = el.get_text(" ", strip=True)
 
         lot_num = "Не найдено"
@@ -122,6 +215,7 @@ class BankrotParser:
         m = re.search(r"Лот\s*№\s*(\d+)", text, flags=re.IGNORECASE)
         if m:
             lot_num = m.group(1)
+
         m = re.search(r"торги\s*№\s*(\d+)", text, flags=re.IGNORECASE)
         if m:
             trade_num = m.group(1)
@@ -151,10 +245,12 @@ class BankrotParser:
                 out[key] = link_num.get("data-number") or link_num.get_text(" ", strip=True).strip()
             else:
                 out[key] = val_el.get_text(" ", strip=True).strip()
+
         return out
 
     def _extract_debtor_inn_contact(self, soup):
         d = self._extract_details_info(soup)
+
         debtor = (
             d.get("Наименование / ФИО")
             or d.get("Полное наименование")
@@ -162,8 +258,10 @@ class BankrotParser:
             or d.get("Сведения о должнике")
             or "Не найдено"
         )
+
         inn = d.get("ИНН", "Не найдено")
         contact = d.get("Контактное лицо", "Не найдено")
+
         return debtor, inn, contact
 
     def _extract_address_from_text(self, text: str):
@@ -232,19 +330,17 @@ class BankrotParser:
             try:
                 self.driver.get(url)
             except Exception:
-                # иногда сайт тормозит; попробуем продолжить
                 pass
 
+            # IMPORTANT: site is slow — wait for lot links
             try:
-                # Ждем появления ссылок на лоты, чтобы убедиться, что контент загружен
                 self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/lot/']")))
                 time.sleep(2.0)
             except TimeoutException:
-                print("Листинг не загрузился или страницы закончились.")
+                print("Лоты не появились (возможно страницы закончились или контент не прогрузился).")
                 break
 
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
-
             links = soup.select("a[href*='/lot/']")
             if not links:
                 print("Ссылки на лоты не найдены (конец списка).")
@@ -271,8 +367,12 @@ class BankrotParser:
 
         return list(lot_links)
 
-    # ---------- lot parsing (returns dict) ----------
+    # ---------- lot parsing ----------
     def parse_lot_page(self, url: str):
+        """
+        Returns: (url, output_row_dict) or (url, None)
+        output_row_dict keys exactly match OUTPUT_COLUMNS
+        """
         try:
             self.driver.get(url)
             self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -290,123 +390,53 @@ class BankrotParser:
 
             accept_from = dates.get("Приём заявок с", "Не найдено")
             accept_to = dates.get("Приём заявок до", "Не найдено")
-            auction_date = dates.get("Дата проведения", "Не найдено")
+            trade_period = f"{accept_from} — {accept_to}"
 
             status = self._extract_status(soup)
-            description, address = self._extract_description_and_address(soup)
-            debtor, inn_debtor, contact_person = self._extract_debtor_inn_contact(soup)
 
-            return {
-                "URL": url,
-                "Номер лота": lot_number,
-                "Торги №": trade_number,
-                "Адрес": address,
+            description, address = self._extract_description_and_address(soup)
+
+            debtor, inn_debtor, contact_person = self._extract_debtor_inn_contact(soup)
+            debtor_info = f"{debtor}; ИНН: {inn_debtor}"
+            if contact_person and contact_person != "Не найдено":
+                debtor_info += f"; Контакт: {contact_person}"
+
+            auction_lot = f"торги №{trade_number}, лот №{lot_number}"
+
+            row = {
+                "Номер аукциона / лота": auction_lot,
+                "Адрес объекта": address,
                 "Начальная цена": start_price,
-                "Шаг повышения": step,
-                "Задаток": zadatok,
-                "Приём заявок с": accept_from,
-                "Приём заявок до": accept_to,
-                "Дата проведения": auction_date,
-                "Статус": status,
-                "Должник": debtor,
-                "ИНН должника": inn_debtor,
-                "Контактное лицо": contact_person,
-                "Описание": description,
+                "Шаг аукциона": step,
+                "Размер задатка": zadatok,
+                "Дата и время начала / окончания торгов": trade_period,
+                "Статус аукциона": status,
+                "Информация о должнике": debtor_info,
+                "Описание объекта": description,
             }
+
+            return (url, row)
 
         except Exception as e:
             print(f"Ошибка парсинга: {url} -> {e}")
-            return None
+            return (url, None)
 
 
 # ----------------------------
-# Excel: split by auction date (sheets)
+# Parallel helpers
 # ----------------------------
-def _parse_bankrot_datetime(value: str):
-    """
-    Ожидаем строки вида:
-    '04.02.2026 12:00' или '04.02.2026 12:00' (внутри могут быть nbsp/лишние пробелы)
-    """
-    if not value or value == "Не найдено":
-        return None
-    v = re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
-    # чаще всего 'dd.mm.yyyy hh:mm'
-    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(v, fmt)
-        except Exception:
-            pass
-    return None
-
-
-
-def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
-    if not rows:
-        print("Нет новых данных для записи в Excel.")
-        return
-
-    df_new = pd.DataFrame(rows)
-
-    # Если файла нет — создаём новый
-    if not os.path.exists(filename):
-        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
-        print(f"Создан новый Excel: {filename} (лист {sheet_name})")
-        return
-
-    # Если файл есть — дописываем вниз
-    wb = load_workbook(filename)
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        start_row = ws.max_row + 1  # следующая строка после последней
-    else:
-        # листа нет — создаём
-        ws = wb.create_sheet(sheet_name)
-        start_row = 1
-
-    # Считаем уже существующие URL, чтобы не дублировать (если вдруг)
-    existing_urls = set()
-    if sheet_name in wb.sheetnames and ws.max_row > 1:
-        # ищем колонку URL по заголовку
-        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-        if "URL" in headers:
-            url_col = headers.index("URL") + 1
-            for r in range(2, ws.max_row + 1):
-                val = ws.cell(row=r, column=url_col).value
-                if val:
-                    existing_urls.add(str(val).strip())
-
-    if existing_urls:
-        df_new = df_new[~df_new["URL"].astype(str).str.strip().isin(existing_urls)]
-
-    if df_new.empty:
-        print("Новых строк для Excel нет (всё уже было).")
-        return
-
-    # Если лист новый (start_row==1) — пишем с заголовками
-    with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-        if start_row == 1:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
-        else:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
-
-    print(f"Добавлено строк в {filename}: {len(df_new)}")
-
-
-# ----------------------------
-# Parallel worker
-# ----------------------------
-def worker_parse(base_url: str, urls, headless: bool, worker_id: int):
+def worker_parse(base_url: str, urls, headless: bool):
     parser = BankrotParser(base_url, headless=headless)
-    out = []
+    out_rows = []
+    out_urls = []
     try:
-        for i, url in enumerate(urls, start=1):
-            row = parser.parse_lot_page(url)
+        for url in urls:
+            u, row = parser.parse_lot_page(url)
             if row:
-                out.append(row)
-            # лёгкая этика + защита от банов
+                out_rows.append(row)
+                out_urls.append(u)
             time.sleep(random.uniform(0.8, 1.6))
-        return out
+        return out_rows, out_urls
     finally:
         parser.close()
 
@@ -425,49 +455,17 @@ def chunk_list(items, n_chunks):
 if __name__ == "__main__":
     BASE_URL = "https://bankrotbaza.ru"
 
-    # ✅ Только квартиры
+    # Only apartments
     APARTMENTS_URL = "https://bankrotbaza.ru/search?comb=all&category%5B%5D=27&type_auction=on&sort=created_desc"
 
-    # --- Будущие апгрейды ---
-    # CATEGORIES = {
-    #     "2": ("Автомобили", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=1&type_auction=on&sort=created_desc"),
-    #     "3": ("Земельные участки", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=12&type_auction=on&sort=created_desc"),
-    #     "4": ("Нежилая недвижимость", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=5&type_auction=on&sort=created_desc"),
-    #     "5": ("Жилая недвижимость", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=10&type_auction=on&sort=created_desc"),
-    #     "6": ("Грузовой транспорт", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=2&type_auction=on&sort=created_desc"),
-    #     "7": ("Задолженности и права требования", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=33&type_auction=on&sort=created_desc"),
-    #     "8": ("Ценные бумаги", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=30&type_auction=on&sort=created_desc"),
-    #     "9": ("ТМЦ", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=24&type_auction=on&sort=created_desc"),
-    #     "10": ("Станки", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=16&type_auction=on&sort=created_desc"),
-    #     "11": ("Коммерческий транспорт", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=3&type_auction=on&sort=created_desc"),
-    #     "12": ("Имущественный комплекс", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=36&type_auction=on&sort=created_desc"),
-    #     "13": ("Сельхоз недвижимость", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=40&type_auction=on&sort=created_desc"),
-    #     "14": ("Сельхоз транспорт", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=41&type_auction=on&sort=created_desc"),
-    #     "15": ("Драгоценности", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=31&type_auction=on&sort=created_desc"),
-    #     "16": ("Сельхоз оборудование", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=42&type_auction=on&sort=created_desc"),
-    #     "17": ("Мебель", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=25&type_auction=on&sort=created_desc"),
-    #     "18": ("ПО", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=22&type_auction=on&sort=created_desc"),
-    #     "19": ("Электрический инвентарь", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=21&type_auction=on&sort=created_desc"),
-    #     "20": ("Компьютеры и оргтехника", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=20&type_auction=on&sort=created_desc"),
-    #     "21": ("Торговое оборудование", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=19&type_auction=on&sort=created_desc"),
-    #     "22": ("Производство прочее", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=18&type_auction=on&sort=created_desc"),
-    #     "23": ("Производственные линии", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=17&type_auction=on&sort=created_desc"),
-    #     "24": ("Электрическое пром. оборудование", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=15&type_auction=on&sort=created_desc"),
-    #     "25": ("Бытовки и незавершенное строительство", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=14&type_auction=on&sort=created_desc"),
-    #     "26": ("Гаражи и машиноместа", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=13&type_auction=on&sort=created_desc"),
-    #     "27": ("Мототехника", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=9&type_auction=on&sort=created_desc"),
-    #     "28": ("Авиатехника", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=8&type_auction=on&sort=created_desc"),
-    #     "29": ("Водный транспорт", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=7&type_auction=on&sort=created_desc"),
-    #     "30": ("Прицепы", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=6&type_auction=on&sort=created_desc"),
-    #     "31": ("Автобусы", "https://bankrotbaza.ru/search?comb=all&category%5B%5D=4&type_auction=on&sort=created_desc"),
-    # }
-
-    MAX_LOTS = 100
-    WORKERS = 3
+    # Settings
+    MAX_LOTS = 300
+    WORKERS = 3          # 2 or 3 recommended
     HEADLESS = False
     SEEN_FILE = "seen_lots.json"
+    OUT_XLSX = "bankrot_apartments.xlsx"
 
-    # 1) собираем ссылки листингом 
+    # 1) listing (single browser)
     listing_parser = BankrotParser(BASE_URL, headless=HEADLESS)
     try:
         print("Сбор ссылок (квартиры)...")
@@ -477,7 +475,7 @@ if __name__ == "__main__":
 
     print(f"Собрано ссылок: {len(all_links)}")
 
-    # 2) фильтруем уже собранные
+    # 2) filter already seen
     store = SeenLotsStore(SEEN_FILE)
     seen = store.load()
 
@@ -488,32 +486,29 @@ if __name__ == "__main__":
         print("Ничего нового — выходим.")
         raise SystemExit(0)
 
-    # 3) параллельный парсинг (каждому потоку — свой Chrome)
+    # 3) parallel parse (each thread has its own Chrome)
     chunks = chunk_list(new_links, WORKERS)
-    results = []
+    results_rows = []
+    parsed_urls = []
 
     print(f"Запуск параллельно: {WORKERS} браузера(ов)")
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futures = []
-        for wid, ch in enumerate(chunks, start=1):
-            if not ch:
-                continue
-            futures.append(ex.submit(worker_parse, BASE_URL, ch, HEADLESS, wid))
+        for ch in chunks:
+            if ch:
+                futures.append(ex.submit(worker_parse, BASE_URL, ch, HEADLESS))
 
         for f in as_completed(futures):
-            part = f.result()
-            if part:
-                results.extend(part)
+            part_rows, part_urls = f.result()
+            results_rows.extend(part_rows)
+            parsed_urls.extend(part_urls)
 
-    print(f"Успешно распарсено: {len(results)}")
+    print(f"Успешно распарсено: {len(results_rows)}")
 
-    # 4) сохраняем Excel “по датам”
-    out_xlsx = "bankrot_apartments.xlsx"
-    append_to_excel(results, out_xlsx, sheet_name="ALL")
+    # 4) append to ONE excel file
+    append_to_excel(results_rows, OUT_XLSX, sheet_name="ALL")
 
-
-    # 5) обновляем память о лотах (сохраняем даже если часть упала)
-    parsed_urls = [r["URL"] for r in results if r and r.get("URL")]
+    # 5) update seen store (so repeats won't parse next run)
     store.add_many(parsed_urls)
     store.save()
     print(f"Память сохранена: {SEEN_FILE} (всего: {len(store.seen)})")
