@@ -25,4 +25,6 @@
 - ОС Windows
 
 ##  Запуск
+```
 python main.py
+```
