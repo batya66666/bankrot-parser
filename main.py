@@ -18,7 +18,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException
-
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
 # ----------------------------
 # Output columns (strict order)
@@ -99,35 +100,67 @@ def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
         with pd.ExcelWriter(filename, engine="openpyxl") as writer:
             df_new.to_excel(writer, index=False, sheet_name=sheet_name)
         print(f"Создан новый Excel: {filename}")
-        return
-
-    wb = load_workbook(filename)
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        start_row = ws.max_row + 1
     else:
-        ws = wb.create_sheet(sheet_name)
-        start_row = 1
-
-    # append
-    with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-        if start_row == 1:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+        wb = load_workbook(filename)
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            # Ищем реальную последнюю строку с данными (чтобы не было пустых строк)
+            check_row = ws.max_row
+            while check_row >= 1:
+                if any(ws.cell(row=check_row, column=c).value is not None for c in range(1, ws.max_column + 1)):
+                    break
+                check_row -= 1
+            start_row = check_row + 1
         else:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
+            ws = wb.create_sheet(sheet_name)
+            start_row = 1
+
+        # append
+        with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+            if start_row == 1:
+                df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+            else:
+                df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
 
     # quick autosize for the active sheet (not perfect but OK)
     wb = load_workbook(filename)
     ws = wb[sheet_name]
-    max_row = min(ws.max_row, 300)
-    for col_idx in range(1, ws.max_column + 1):
-        max_len = 0
-        for r in range(1, max_row + 1):
-            v = ws.cell(row=r, column=col_idx).value
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 80)
+
+    # 1) Закрепить шапку
+    ws.freeze_panes = "A2"
+
+    # 2) Жирная шапка + выравнивание
+    header_font = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+
+    # 3) Фиксированные ширины (чтобы выглядело аккуратно)
+    col_widths = {
+        "Номер аукциона / лота": 25,
+        "Адрес объекта": 65,
+        "Начальная цена": 25,
+        "Шаг аукциона": 25,
+        "Размер задатка": 25,
+        "Дата и время начала / окончания торгов": 45,
+        "Статус аукциона": 25,
+        "Информация о должнике": 65,
+        "Описание объекта": 100,
+    }
+
+    # ставим ширины по названиям колонок
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    for idx, name in enumerate(headers, start=1):
+        if name in col_widths:
+            ws.column_dimensions[get_column_letter(idx)].width = col_widths[name]
+
+    # 4) Перенос текста + верхнее выравнивание для длинных колонок
+    wrap_cols = set()
+    for idx, name in enumerate(headers, start=1):
+        if name in wrap_cols:
+            for r in range(2, ws.max_row + 1):
+                ws.cell(row=r, column=idx).alignment = Alignment(wrap_text=True, vertical="top")
+
     wb.save(filename)
 
     print(f"Добавлено строк в {filename}: {len(df_new)}")
@@ -401,7 +434,7 @@ class BankrotParser:
             if contact_person and contact_person != "Не найдено":
                 debtor_info += f"; Контакт: {contact_person}"
 
-            auction_lot = f"торги №{trade_number}, лот №{lot_number}"
+            auction_lot = f"{trade_number} / {lot_number}"
 
             row = {
                 "Номер аукциона / лота": auction_lot,
@@ -414,6 +447,11 @@ class BankrotParser:
                 "Информация о должнике": debtor_info,
                 "Описание объекта": description,
             }
+
+            # Если ключевые поля не найдены, не добавляем "пустую" строку в Excel
+            if start_price == "Не найдено" and address == "Не найдено":
+                print(f"--> Пропуск 'пустого' лота (нет данных): {url}")
+                return (url, None)
 
             return (url, row)
 
@@ -459,8 +497,8 @@ if __name__ == "__main__":
     APARTMENTS_URL = "https://bankrotbaza.ru/search?comb=all&category%5B%5D=27&type_auction=on&sort=created_desc"
 
     # Settings
-    MAX_LOTS = 300
-    WORKERS = 3          # 2 or 3 recommended
+    MAX_LOTS = 600
+    WORKERS = 3          
     HEADLESS = False
     SEEN_FILE = "seen_lots.json"
     OUT_XLSX = "bankrot_apartments.xlsx"
