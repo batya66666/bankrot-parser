@@ -5,7 +5,7 @@ import re
 import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from openpyxl import load_workbook
 import pandas as pd
 from bs4 import BeautifulSoup
 
@@ -339,48 +339,58 @@ def _parse_bankrot_datetime(value: str):
     return None
 
 
-def save_to_excel_split_by_date(rows, filename: str):
+
+def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
     if not rows:
-        print("Нет данных для сохранения.")
+        print("Нет новых данных для записи в Excel.")
         return
 
-    df = pd.DataFrame(rows)
+    df_new = pd.DataFrame(rows)
 
-    # техническая колонка для группировки
-    df["_auction_dt"] = df["Дата проведения"].apply(_parse_bankrot_datetime)
-    df["_auction_date"] = df["_auction_dt"].apply(lambda x: x.date().isoformat() if x else "unknown")
+    # Если файла нет — создаём новый
+    if not os.path.exists(filename):
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+        print(f"Создан новый Excel: {filename} (лист {sheet_name})")
+        return
 
-    # сортировка
-    df = df.sort_values(by=["_auction_date", "_auction_dt"], kind="stable")
+    # Если файл есть — дописываем вниз
+    wb = load_workbook(filename)
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        start_row = ws.max_row + 1  # следующая строка после последней
+    else:
+        # листа нет — создаём
+        ws = wb.create_sheet(sheet_name)
+        start_row = 1
 
-    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-        # Общий лист
-        df.drop(columns=["_auction_dt", "_auction_date"]).to_excel(writer, index=False, sheet_name="ALL")
+    # Считаем уже существующие URL, чтобы не дублировать (если вдруг)
+    existing_urls = set()
+    if sheet_name in wb.sheetnames and ws.max_row > 1:
+        # ищем колонку URL по заголовку
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        if "URL" in headers:
+            url_col = headers.index("URL") + 1
+            for r in range(2, ws.max_row + 1):
+                val = ws.cell(row=r, column=url_col).value
+                if val:
+                    existing_urls.add(str(val).strip())
 
-        # Листы по датам проведения
-        for date_key, g in df.groupby("_auction_date"):
-            sheet = date_key
-            # Excel sheet name limit 31 chars
-            if len(sheet) > 31:
-                sheet = sheet[:31]
-            g.drop(columns=["_auction_dt", "_auction_date"]).to_excel(writer, index=False, sheet_name=sheet)
+    if existing_urls:
+        df_new = df_new[~df_new["URL"].astype(str).str.strip().isin(existing_urls)]
 
-        # автоширина (без фанатизма)
-        from openpyxl.utils import get_column_letter
-        for sheet_name, ws in writer.sheets.items():
-            # считаем ширины по первой ~300 строке (чтобы не тормозить)
-            max_row = min(ws.max_row, 300)
-            for col_idx in range(1, ws.max_column + 1):
-                col_letter = get_column_letter(col_idx)
-                max_len = 0
-                for r in range(1, max_row + 1):
-                    val = ws.cell(row=r, column=col_idx).value
-                    if val is None:
-                        continue
-                    max_len = max(max_len, len(str(val)))
-                ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
+    if df_new.empty:
+        print("Новых строк для Excel нет (всё уже было).")
+        return
 
-    print(f"Excel сохранён: {filename}")
+    # Если лист новый (start_row==1) — пишем с заголовками
+    with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+        if start_row == 1:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
+        else:
+            df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
+
+    print(f"Добавлено строк в {filename}: {len(df_new)}")
 
 
 # ----------------------------
@@ -498,9 +508,9 @@ if __name__ == "__main__":
     print(f"Успешно распарсено: {len(results)}")
 
     # 4) сохраняем Excel “по датам”
-    today = datetime.now().strftime("%Y-%m-%d")
-    out_xlsx = f"bankrot_apartments_{today}.xlsx"
-    save_to_excel_split_by_date(results, out_xlsx)
+    out_xlsx = "bankrot_apartments.xlsx"
+    append_to_excel(results, out_xlsx, sheet_name="ALL")
+
 
     # 5) обновляем память о лотах (сохраняем даже если часть упала)
     parsed_urls = [r["URL"] for r in results if r and r.get("URL")]
