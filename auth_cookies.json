@@ -1,0 +1,20 @@
+[{
+        "name": "bankrotbaza_session",
+        "value": "eyJpdiI6InNYUHVkSzgyWjNiN1Yra0U4N0h2dnc9PSIsInZhbHVlIjoiVjFvWTAvaUtqRkpKeStoQlZGSG82YWN0ZTRrbmszTlFDbGdHUWJSNWJ4bXROOTArNlF5SXpUNWNKSWFoRHEvcXU0YWIzcmc5T29DZkxVa2Jtdk1JR2VjMkg5RktCU29DVGdRcXRJSkc3R2RGbXczRVJDK1l2ekkyK0xYUmpGWGsiLCJtYWMiOiI1YzRmZjY2ZDVlODVlMWUyMzc3MTJmYmE0MDZiMzY0ZjQzOGIyZDY2MjE5YzNjNjM3Mjc5OTQ4NTAwNGJkODU5In0%3D",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true
+    },
+    {
+        "name": "XSRF-TOKEN",
+        "value": "eyJpdiI6IkZId25qL1pnL2JISjY1bVV2VFB2QkE9PSIsInZhbHVlIjoiMVpUQ29KTG8rTi9GMTY5RE9qaS9TK0ZUUTZndkJnRjdTd3hOU1ExK3hrQ1BVUW5DbGtFYnU0c1ZubHNaSjZLNU55SWhud3FJalJqaDBLK2QyaGd1YXN1UGZlK0N4SjJQZ2dHMmplcWtmbjh2TUVjcURHNkxpdXlrcVhkZVVBYmwiLCJtYWMiOiIxNzk1MmYwOTg1NmE2ZmQ5Y2Q5NGQyZmFkNTg1MTYxMjcxMzIzODkwYzhlYzAxZjg3Y2ZhMTY1ZjlmMzUyNjAwIn0%3D",
+        "path": "/",
+        "secure": true
+    },
+    {
+        "name": "kbCheck",
+        "value": "ac920ad4413d3dc1a837da6b9c847383",
+        "path": "/"
+    }
+
+]

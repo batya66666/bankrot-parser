@@ -3,12 +3,13 @@ import json
 import time
 import re
 import random
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
 from bs4 import BeautifulSoup
-from openpyxl import load_workbook
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -18,11 +19,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException
-from openpyxl.styles import Alignment, Font
-from openpyxl.utils import get_column_letter
 
 # ----------------------------
 # Output columns (strict order)
+# (Документы сразу после дат)
 # ----------------------------
 OUTPUT_COLUMNS = [
     "Номер аукциона / лота",
@@ -31,10 +31,14 @@ OUTPUT_COLUMNS = [
     "Шаг аукциона",
     "Размер задатка",
     "Дата и время начала / окончания торгов",
+    "Документы",
     "Статус аукциона",
     "Информация о должнике",
     "Описание объекта",
 ]
+
+DOCS_SHEET_NAME = "Documents"
+MAIN_SHEET_NAME = "ALL"
 
 
 # ----------------------------
@@ -76,66 +80,107 @@ class SeenLotsStore:
 
 
 # ----------------------------
-# Excel append (one file, append rows)
+# Cookies auth helper
 # ----------------------------
-def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
-    """
-    rows: list[dict] with keys = OUTPUT_COLUMNS
-    Appends new rows to an existing Excel file (or creates it).
-    """
-    if not rows:
-        print("Нет новых данных для записи в Excel.")
-        return
+def load_auth_cookies(cookies_path: str):
+    if not cookies_path or not os.path.exists(cookies_path):
+        return []
+    try:
+        with open(cookies_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
-    df_new = pd.DataFrame(rows)
 
-    # ensure all columns exist and strict order
-    for col in OUTPUT_COLUMNS:
-        if col not in df_new.columns:
-            df_new[col] = ""
-    df_new = df_new[OUTPUT_COLUMNS]
+def apply_cookies_to_driver(driver, base_url: str, cookies_path: str):
+    cookies = load_auth_cookies(cookies_path)
+    if not cookies:
+        print("auth_cookies.json не найден или пустой")
+        return False
 
-    # create file if not exists
-    if not os.path.exists(filename):
-        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-            df_new.to_excel(writer, index=False, sheet_name=sheet_name)
-        print(f"Создан новый Excel: {filename}")
-    else:
+    # ОБЯЗАТЕЛЬНО открыть домен
+    driver.get(base_url.rstrip("/") + "/")
+    time.sleep(1.2)
+
+    added = 0
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+
+        # минимальный набор, без domain/expiry/samesite (самый стабильный вариант)
+        cc = {
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "path": c.get("path", "/"),
+        }
+
+        if "secure" in c:
+            cc["secure"] = bool(c["secure"])
+        if "httpOnly" in c:
+            cc["httpOnly"] = bool(c["httpOnly"])
+
+        if not cc["name"] or cc["value"] is None:
+            continue
+
+        try:
+            driver.add_cookie(cc)
+            added += 1
+        except Exception as e:
+            print("cookie skip:", cc.get("name"), e)
+
+    driver.refresh()
+    time.sleep(1.2)
+
+    page = driver.page_source.lower()
+    is_ok = ("войти" not in page)
+    print(f"Cookies applied: {added}, logged_in={is_ok}")
+
+    if not is_ok:
+        print("⚠️ Похоже, авторизация не применилось. Обнови auth_cookies.json (bankrotbaza_session + XSRF-TOKEN).")
+
+    return is_ok
+
+
+# ----------------------------
+# Excel helpers (ALL + Documents with hyperlinks)
+# ----------------------------
+def ensure_workbook(filename: str):
+    if os.path.exists(filename):
         wb = load_workbook(filename)
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            # Ищем реальную последнюю строку с данными (чтобы не было пустых строк)
-            check_row = ws.max_row
-            while check_row >= 1:
-                if any(ws.cell(row=check_row, column=c).value is not None for c in range(1, ws.max_column + 1)):
-                    break
-                check_row -= 1
-            start_row = check_row + 1
-        else:
-            ws = wb.create_sheet(sheet_name)
-            start_row = 1
+    else:
+        wb = Workbook()
 
-        # append
-        with pd.ExcelWriter(filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-            if start_row == 1:
-                df_new.to_excel(writer, index=False, sheet_name=sheet_name)
-            else:
-                df_new.to_excel(writer, index=False, sheet_name=sheet_name, header=False, startrow=start_row - 1)
+    # MAIN sheet
+    if MAIN_SHEET_NAME in wb.sheetnames:
+        ws_main = wb[MAIN_SHEET_NAME]
+    else:
+        ws_main = wb.active
+        ws_main.title = MAIN_SHEET_NAME
+        ws_main.append(OUTPUT_COLUMNS)
 
-    # quick autosize for the active sheet (not perfect but OK)
-    wb = load_workbook(filename)
-    ws = wb[sheet_name]
+    # DOCS sheet
+    if DOCS_SHEET_NAME in wb.sheetnames:
+        ws_docs = wb[DOCS_SHEET_NAME]
+    else:
+        ws_docs = wb.create_sheet(DOCS_SHEET_NAME)
+        ws_docs.append(["Номер аукциона / лота", "Документы"])
 
-    # 1) Закрепить шапку
-    ws.freeze_panes = "A2"
-
-    # 2) Жирная шапка + выравнивание
     header_font = Font(bold=True)
-    for cell in ws[1]:
+    for cell in ws_main[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+    for cell in ws_docs[1]:
         cell.font = header_font
         cell.alignment = Alignment(vertical="center")
 
-    # 3) Фиксированные ширины (чтобы выглядело аккуратно)
+    ws_main.freeze_panes = "A2"
+    ws_docs.freeze_panes = "A2"
+
+    return wb, ws_main, ws_docs
+
+
+def set_column_widths(ws):
     col_widths = {
         "Номер аукциона / лота": 25,
         "Адрес объекта": 65,
@@ -143,35 +188,144 @@ def append_to_excel(rows, filename: str, sheet_name: str = "ALL"):
         "Шаг аукциона": 25,
         "Размер задатка": 25,
         "Дата и время начала / окончания торгов": 45,
+        "Документы": 18,
         "Статус аукциона": 25,
         "Информация о должнике": 65,
         "Описание объекта": 100,
     }
 
-    # ставим ширины по названиям колонок
     headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
     for idx, name in enumerate(headers, start=1):
         if name in col_widths:
             ws.column_dimensions[get_column_letter(idx)].width = col_widths[name]
 
-    # 4) Перенос текста + верхнее выравнивание для длинных колонок
-    wrap_cols = set()
-    for idx, name in enumerate(headers, start=1):
-        if name in wrap_cols:
-            for r in range(2, ws.max_row + 1):
-                ws.cell(row=r, column=idx).alignment = Alignment(wrap_text=True, vertical="top")
+
+def read_existing_lot_keys(ws_docs) -> set:
+    """Чтобы не дублировать строки лота на Documents при повторном запуске"""
+    keys = set()
+    for r in range(2, ws_docs.max_row + 1):
+        v = ws_docs.cell(row=r, column=1).value
+        if v:
+            keys.add(str(v).strip())
+    return keys
+
+
+def append_documents_row_wide(ws_docs, lot_key: str, docs: list) -> int:
+    """
+    Добавляет 1 строку:
+      A = lot_key
+      B.. = документы (кликабельные гиперссылки)
+    Возвращает номер строки, куда записали.
+    """
+    r = ws_docs.max_row + 1
+    ws_docs.cell(row=r, column=1).value = lot_key
+
+    col = 2
+    for name, url in docs:
+        if not name or not url:
+            continue
+
+        cell = ws_docs.cell(row=r, column=col)
+        cell.value = name
+        cell.hyperlink = url
+        cell.style = "Hyperlink"
+        col += 1
+
+    return r
+
+
+
+def append_rows_with_documents(rows: list, filename: str):
+    """
+    rows: list of dict with OUTPUT_COLUMNS + internal field:
+      - __docs: list[(name,url)]
+    Writes:
+      - sheet ALL: основные данные + гиперссылка на строку лота в Documents
+      - sheet Documents: 1 строка на 1 лот, документы в ширину (B..)
+    """
+    if not rows:
+        print("Нет новых данных для записи в Excel.")
+        return
+
+    wb, ws_main, ws_docs = ensure_workbook(filename)
+
+    # чтобы не добавлять повторные строки на Documents
+    existing_lot_keys_docs = read_existing_lot_keys(ws_docs)
+
+    # Map header -> column index in MAIN
+    main_headers = [ws_main.cell(row=1, column=c).value for c in range(1, ws_main.max_column + 1)]
+    header_to_col = {h: i + 1 for i, h in enumerate(main_headers)}
+
+    docs_col = header_to_col.get("Документы")
+    if not docs_col:
+        ws_main.cell(row=1, column=ws_main.max_column + 1).value = "Документы"
+        docs_col = ws_main.max_column
+        header_to_col["Документы"] = docs_col
+
+    added_rows = 0
+
+    for row in rows:
+        docs = row.pop("__docs", [])
+        out = {c: row.get(c, "") for c in OUTPUT_COLUMNS}
+
+        # 1) write MAIN row
+        main_row_index = ws_main.max_row + 1
+        for col_name in OUTPUT_COLUMNS:
+            col_idx = header_to_col.get(col_name)
+            if not col_idx:
+                col_idx = ws_main.max_column + 1
+                ws_main.cell(row=1, column=col_idx).value = col_name
+                header_to_col[col_name] = col_idx
+            ws_main.cell(row=main_row_index, column=col_idx).value = out.get(col_name, "")
+
+        # 2) write Documents row "wide" once per lot_key
+        lot_key = out.get("Номер аукциона / лота", "").strip()
+        docs_count = len([d for d in docs if d and d[1]])
+
+        c_docs = ws_main.cell(row=main_row_index, column=docs_col)
+
+        if not lot_key or docs_count == 0:
+            c_docs.value = "Документы (0)"
+        else:
+            # если уже есть строка на Documents — просто найдём её номер (скан, но быстро)
+            if lot_key in existing_lot_keys_docs:
+                # ищем строку
+                doc_row = 0
+                for r in range(2, ws_docs.max_row + 1):
+                    v = ws_docs.cell(row=r, column=1).value
+                    if v and str(v).strip() == lot_key:
+                        doc_row = r
+                        break
+            else:
+                doc_row = append_documents_row_wide(ws_docs, lot_key, docs)
+                existing_lot_keys_docs.add(lot_key)
+
+            c_docs.value = f"Документы ({docs_count})"
+            c_docs.hyperlink = f"#'{DOCS_SHEET_NAME}'!A{doc_row}"
+            c_docs.style = "Hyperlink"
+
+        added_rows += 1
+
+    # widths
+    set_column_widths(ws_main)
+
+    ws_docs.column_dimensions["A"].width = 25
+    # для документов B.. пусть будет нормальная ширина
+    for col_idx in range(2, min(ws_docs.max_column, 40) + 1):  # ограничим 40 колонок на всякий
+        ws_docs.column_dimensions[get_column_letter(col_idx)].width = 45
 
     wb.save(filename)
+    print(f"Добавлено строк в {filename}: {added_rows}")
 
-    print(f"Добавлено строк в {filename}: {len(df_new)}")
 
 
 # ----------------------------
 # Parser
 # ----------------------------
 class BankrotParser:
-    def __init__(self, base_url: str, headless: bool = False, page_load_timeout: int = 25):
+    def __init__(self, base_url: str, headless: bool = False, page_load_timeout: int = 25, cookies_path: str = None):
         self.base_url = base_url.rstrip("/")
+        self.cookies_path = cookies_path
 
         chrome_options = Options()
         if headless:
@@ -183,11 +337,6 @@ class BankrotParser:
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
         )
-
-        # Optional: if you want to use your Chrome profile (helps if site blocks)
-        # Close all Chrome windows before enabling this!
-        # chrome_options.add_argument(r"--user-data-dir=C:\Users\basch\AppData\Local\Google\Chrome\User Data")
-        # chrome_options.add_argument(r"--profile-directory=Default")
 
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
@@ -203,13 +352,16 @@ class BankrotParser:
         self.driver.set_page_load_timeout(page_load_timeout)
         self.wait = WebDriverWait(self.driver, 12)
 
+        # Apply cookies
+        if self.cookies_path:
+            apply_cookies_to_driver(self.driver, self.base_url, self.cookies_path)
+
     def close(self):
         try:
             self.driver.quit()
         except Exception:
             pass
 
-    # ---------- extraction helpers ----------
     def _parse_info_wrapper(self, soup, title_text: str):
         wrappers = soup.select("div.lot-info__wrapper")
         target = title_text.strip().lower()
@@ -241,7 +393,6 @@ class BankrotParser:
             return ("Не найдено", "Не найдено")
 
         text = el.get_text(" ", strip=True)
-
         lot_num = "Не найдено"
         trade_num = "Не найдено"
 
@@ -283,7 +434,6 @@ class BankrotParser:
 
     def _extract_debtor_inn_contact(self, soup):
         d = self._extract_details_info(soup)
-
         debtor = (
             d.get("Наименование / ФИО")
             or d.get("Полное наименование")
@@ -291,10 +441,8 @@ class BankrotParser:
             or d.get("Сведения о должнике")
             or "Не найдено"
         )
-
         inn = d.get("ИНН", "Не найдено")
         contact = d.get("Контактное лицо", "Не найдено")
-
         return debtor, inn, contact
 
     def _extract_address_from_text(self, text: str):
@@ -350,7 +498,22 @@ class BankrotParser:
         addr = self._extract_address_from_text(full)
         return (full if full.strip() else "Не найдено", addr)
 
-    # ---------- listing ----------
+    def _extract_documents(self, soup):
+        docs = []
+        for a in soup.select(".lot-documents__wrapper a.lot-documents__link"):
+            href = (a.get("href") or "").strip()
+            name = a.get_text(" ", strip=True).strip()
+            if href and name:
+                docs.append((name, href))
+
+        seen = set()
+        uniq = []
+        for name, href in docs:
+            if href not in seen:
+                seen.add(href)
+                uniq.append((name, href))
+        return uniq
+
     def get_listing_urls(self, category_url: str, max_lots: int = 300):
         lot_links = set()
         current_page = 1
@@ -365,7 +528,6 @@ class BankrotParser:
             except Exception:
                 pass
 
-            # IMPORTANT: site is slow — wait for lot links
             try:
                 self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/lot/']")))
                 time.sleep(2.0)
@@ -400,12 +562,7 @@ class BankrotParser:
 
         return list(lot_links)
 
-    # ---------- lot parsing ----------
     def parse_lot_page(self, url: str):
-        """
-        Returns: (url, output_row_dict) or (url, None)
-        output_row_dict keys exactly match OUTPUT_COLUMNS
-        """
         try:
             self.driver.get(url)
             self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -426,7 +583,6 @@ class BankrotParser:
             trade_period = f"{accept_from} — {accept_to}"
 
             status = self._extract_status(soup)
-
             description, address = self._extract_description_and_address(soup)
 
             debtor, inn_debtor, contact_person = self._extract_debtor_inn_contact(soup)
@@ -435,6 +591,7 @@ class BankrotParser:
                 debtor_info += f"; Контакт: {contact_person}"
 
             auction_lot = f"{trade_number} / {lot_number}"
+            docs = self._extract_documents(soup)
 
             row = {
                 "Номер аукциона / лота": auction_lot,
@@ -443,12 +600,13 @@ class BankrotParser:
                 "Шаг аукциона": step,
                 "Размер задатка": zadatok,
                 "Дата и время начала / окончания торгов": trade_period,
+                "Документы": "",
                 "Статус аукциона": status,
                 "Информация о должнике": debtor_info,
                 "Описание объекта": description,
+                "__docs": docs,
             }
 
-            # Если ключевые поля не найдены, не добавляем "пустую" строку в Excel
             if start_price == "Не найдено" and address == "Не найдено":
                 print(f"--> Пропуск 'пустого' лота (нет данных): {url}")
                 return (url, None)
@@ -463,8 +621,8 @@ class BankrotParser:
 # ----------------------------
 # Parallel helpers
 # ----------------------------
-def worker_parse(base_url: str, urls, headless: bool):
-    parser = BankrotParser(base_url, headless=headless)
+def worker_parse(base_url: str, urls, headless: bool, cookies_path: str):
+    parser = BankrotParser(base_url, headless=headless, cookies_path=cookies_path)
     out_rows = []
     out_urls = []
     try:
@@ -492,19 +650,23 @@ def chunk_list(items, n_chunks):
 # ----------------------------
 if __name__ == "__main__":
     BASE_URL = "https://bankrotbaza.ru"
-
-    # Only apartments
     APARTMENTS_URL = "https://bankrotbaza.ru/search?comb=all&category%5B%5D=27&type_auction=on&sort=created_desc"
 
-    # Settings
-    MAX_LOTS = 600
-    WORKERS = 3          
+    MAX_LOTS = 500
+    WORKERS = 3
     HEADLESS = False
+
     SEEN_FILE = "seen_lots.json"
     OUT_XLSX = "bankrot_apartments.xlsx"
+    COOKIES_FILE = "auth_cookies.json"
 
-    # 1) listing (single browser)
-    listing_parser = BankrotParser(BASE_URL, headless=HEADLESS)
+    print("Cookies path:", os.path.abspath(COOKIES_FILE), "exists:", os.path.exists(COOKIES_FILE))
+    if not os.path.exists(COOKIES_FILE):
+        print("❌ Не найден auth_cookies.json. Создай файл рядом со скриптом.")
+        raise SystemExit(1)
+
+    # 1) listing
+    listing_parser = BankrotParser(BASE_URL, headless=HEADLESS, cookies_path=COOKIES_FILE)
     try:
         print("Сбор ссылок (квартиры)...")
         all_links = listing_parser.get_listing_urls(APARTMENTS_URL, max_lots=MAX_LOTS)
@@ -513,7 +675,7 @@ if __name__ == "__main__":
 
     print(f"Собрано ссылок: {len(all_links)}")
 
-    # 2) filter already seen
+    # 2) filter seen
     store = SeenLotsStore(SEEN_FILE)
     seen = store.load()
 
@@ -524,7 +686,7 @@ if __name__ == "__main__":
         print("Ничего нового — выходим.")
         raise SystemExit(0)
 
-    # 3) parallel parse (each thread has its own Chrome)
+    # 3) parallel parse
     chunks = chunk_list(new_links, WORKERS)
     results_rows = []
     parsed_urls = []
@@ -534,7 +696,7 @@ if __name__ == "__main__":
         futures = []
         for ch in chunks:
             if ch:
-                futures.append(ex.submit(worker_parse, BASE_URL, ch, HEADLESS))
+                futures.append(ex.submit(worker_parse, BASE_URL, ch, HEADLESS, COOKIES_FILE))
 
         for f in as_completed(futures):
             part_rows, part_urls = f.result()
@@ -543,10 +705,10 @@ if __name__ == "__main__":
 
     print(f"Успешно распарсено: {len(results_rows)}")
 
-    # 4) append to ONE excel file
-    append_to_excel(results_rows, OUT_XLSX, sheet_name="ALL")
+    # 4) write excel
+    append_rows_with_documents(results_rows, OUT_XLSX)
 
-    # 5) update seen store (so repeats won't parse next run)
+    # 5) save seen
     store.add_many(parsed_urls)
     store.save()
     print(f"Память сохранена: {SEEN_FILE} (всего: {len(store.seen)})")
